@@ -22,12 +22,17 @@ struct serverinfo {
 async fn main() {
     let pool = PgPoolOptions::new()
         .max_connections(50)
-        .connect("postgres://postgres:Erik0601!@localhost/postgres").await.unwrap();
+        .connect("postgres://postgres:Erik0601!@mcinfos.de/postgres").await.unwrap();
+	loop {
     let ips = db_read(&pool).await;
     let mut set = JoinSet::new();
     for ip in ips {
     set.spawn(async move {
-        let ergebnis = timeout(Duration::from_secs(5), pinger(ip)).await.expect("timeout");
+        let ergebnis = timeout(Duration::from_secs(5), pinger(ip)).await;
+        let unwraped_ergebnis = match ergebnis {
+            Ok(k) => k,
+            Err(e) => e,
+        };
         ergebnis
     });
     }
@@ -46,8 +51,8 @@ async fn main() {
                         ergebnisse_protocol.push(ergebnis.protocol as i32);
                         ergebnisse_max_players.push(ergebnis.max_players as i32);
                         ergebnisse_online_players.push(ergebnis.online_players as i32);
-                        ergebnisse_description.push(descriptioniser(ergebnis.description).await);
-                        ergebnisse_sample.push(sampler(ergebnis.sample).await);
+                        ergebnisse_description.push(descriptioniser(ergebnis.description));
+                        ergebnisse_sample.push(sampler(ergebnis.sample));
                     }
                     Err(_) => {continue},
                 }
@@ -58,17 +63,16 @@ async fn main() {
     let lenght_test = &ergebnisse_version.len();
     let Result = db_write(&pool, ergebnisse_version, ergebnisse_protocol, ergebnisse_max_players, ergebnisse_online_players, ergebnisse_description, ergebnisse_sample).await;
     println!("20k fertig! Vec_leage: {lenght_test} Batch-insert Ergebnis: {:?}", Result);
-}
+}}
 async fn db_read(pool: &Pool<Postgres>)  -> Vec<IpNetwork> {
-    let ips: Vec<IpNetwork> = sqlx::query_scalar("SELECT IP FROM IPS LIMIT 20;")
+    let ips: Vec<IpNetwork> = sqlx::query_scalar("SELECT IP FROM IPS LIMIT 200;")
         .fetch_all(pool)
         .await
         .unwrap();
     ips
 }
 async fn pinger(ip: IpNetwork) -> Result<Response, std::io::Error> {
-    let _hostnamee: &str = &ip.to_string();
-    let hostname: &str = "40.223.14.64";
+    let hostname: &str = &ip.to_string();
     let port = 25565;
     let stream_nt_unwraped = TcpStream::connect((hostname, port)).await;
     let mut stream = match stream_nt_unwraped {
@@ -96,11 +100,11 @@ async fn as_i32(zahl: &usize) -> i32 {
     let i32_zahl: i32 = *zahl as i32;
     i32_zahl
 }
-async fn sampler(players: Option<Vec<Player>>) -> String {
+fn sampler(players: Option<Vec<Player>>) -> String {
     let json = serde_json::to_string(&players).unwrap();
     json
 }
-async fn descriptioniser(description: Option<Value>) -> String {
+fn descriptioniser(description: Option<Value>) -> String {
     let json = serde_json::to_string(&description).unwrap();
     json
 }
