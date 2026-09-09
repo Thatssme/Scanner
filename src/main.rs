@@ -1,5 +1,5 @@
 use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, error::Elapsed};
 use craftping::tokio::ping;
 use craftping::Response;
 use sqlx::{Pool, Postgres};
@@ -9,15 +9,7 @@ use serde::{Deserialize, Serialize};
 use ipnetwork::IpNetwork;
 use serde_json::Value;
 use craftping::Player;
-#[derive(Debug, Serialize, Deserialize)]
-struct serverinfo {
-    version: String,
-    protocol: i32,
-    max_players: usize,
-    online_players: usize,
-    sample: Option<Vec<Player>>,
-    description: Option<Value>,
-}
+use craftping::Error;
 #[tokio::main]
 async fn main() {
     let pool = PgPoolOptions::new()
@@ -29,39 +21,46 @@ async fn main() {
     for ip in ips {
     set.spawn(async move {
         let ergebnis = timeout(Duration::from_secs(5), pinger(ip)).await;
-        let unwraped_ergebnis = match ergebnis {
-            Ok(k) => k,
-            Err(e) => e,
+        let ergebnis = match ergebnis {
+            Ok(k) => Some(k),
+            _ => None,
         };
-        ergebnis
     });
     }
+    let mut ergebnisse_ip: Vec<String> = Vec::new();
     let mut ergebnisse_version: Vec<String> = Vec::new();
     let mut ergebnisse_protocol: Vec<i32> = Vec::new();
     let mut ergebnisse_max_players: Vec<i32> = Vec::new();
     let mut ergebnisse_online_players: Vec<i32> = Vec::new();
     let mut ergebnisse_description: Vec<String> = Vec::new();
     let mut ergebnisse_sample: Vec<String> = Vec::new();
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok(r) => {
-                match r {
-                    Ok(ergebnis) => {
-                        ergebnisse_version.push(ergebnis.version);
-                        ergebnisse_protocol.push(ergebnis.protocol as i32);
-                        ergebnisse_max_players.push(ergebnis.max_players as i32);
-                        ergebnisse_online_players.push(ergebnis.online_players as i32);
-                        ergebnisse_description.push(descriptioniser(ergebnis.description));
-                        ergebnisse_sample.push(sampler(ergebnis.sample));
-                    }
-                    Err(_) => {continue},
+    while let Some(res1) = set.join_next().await {
+        match res1 {
+            Ok(res) => {
+                match res {
+                    Some(r) => {
+                        match r {
+                            Ok(ergebnis) => {
+                                let ergebnis = ergebnis.0;
+                                ergebnisse_ip.push(ergebnis.1);
+                                ergebnisse_version.push(ergebnis.version);
+                                ergebnisse_protocol.push(ergebnis.protocol as i32);
+                                ergebnisse_max_players.push(ergebnis.max_players as i32);
+                                ergebnisse_online_players.push(ergebnis.online_players as i32);
+                                ergebnisse_description.push(descriptioniser(ergebnis.description));
+                                ergebnisse_sample.push(sampler(ergebnis.sample));
+                                }
+                            Err(_) => {continue},
+                        }
+                    },
+                    None => {continue},
                 }
             },
-            Err(_) => {continue},
+            Err(e) => {continue;},
         };
     }
     let lenght_test = &ergebnisse_version.len();
-    let Result = db_write(&pool, ergebnisse_version, ergebnisse_protocol, ergebnisse_max_players, ergebnisse_online_players, ergebnisse_description, ergebnisse_sample).await;
+    let Result = db_write(&pool, ergebnisse_ip, ergebnisse_version, ergebnisse_protocol, ergebnisse_max_players, ergebnisse_online_players, ergebnisse_description, ergebnisse_sample).await;
     println!("20k fertig! Vec_leage: {lenght_test} Batch-insert Ergebnis: {:?}", Result);
 }}
 async fn db_read(pool: &Pool<Postgres>)  -> Vec<IpNetwork> {
@@ -71,20 +70,24 @@ async fn db_read(pool: &Pool<Postgres>)  -> Vec<IpNetwork> {
         .unwrap();
     ips
 }
-async fn pinger(ip: IpNetwork) -> Result<Response, std::io::Error> {
-    let hostname: &str = &ip.to_string();
+async fn pinger(ip: IpNetwork) -> (Result<Response, craftping::Error>, String) {
+    let hostnamee: &str = &ip.to_string();
+    let hostname: &str = "5.175.249.209";
     let port = 25565;
     let stream_nt_unwraped = TcpStream::connect((hostname, port)).await;
     let mut stream = match stream_nt_unwraped {
-        Ok(k) => {k},
-        Err(e) => {return Err(e)},
+        Ok(k) => {Some(k)},
+        Err(e) => {None},
     };
-    let ping = ping(&mut stream, hostname, port).await.expect("Nicht erreichbar");
-    Ok(ping)
+    if let Some(stream) = stream {
+        let ping = ping(&mut stream, hostname, port).await;
+        return (ping, hostname.to_string())
+    };
 }
-async fn db_write(pool: &Pool<Postgres>, ergebnisse_version: Vec<String>, ergebnisse_protocol: Vec<i32>, ergebnisse_max_players: Vec<i32>, ergebnisse_online_players: Vec<i32>, ergebnisse_description: Vec<String>, ergebnisse_sample: Vec<String>) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error>{
+async fn db_write(pool: &Pool<Postgres>, ergebnisse_ip: Vec<String>, ergebnisse_version: Vec<String>, ergebnisse_protocol: Vec<i32>, ergebnisse_max_players: Vec<i32>, ergebnisse_online_players: Vec<i32>, ergebnisse_description: Vec<String>, ergebnisse_sample: Vec<String>) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error>{
     let Result = sqlx::query(
-        r#"INSERT INTO scanner_ergebnisse (version, protocol, max_players, online_players, sample, description) SELECT * FROM UNNEST($1, $2, $3, $4, $5, $6)"#)
+        r#"INSERT INTO scanner_ergebnisse (ip, version, protocol, max_players, online_players, sample, description) SELECT * FROM UNNEST($1, $2, $3, $4, $5, $6)"#)
+        .bind(ergebnisse_ip)
         .bind(ergebnisse_version)
         .bind(ergebnisse_protocol)
         .bind(ergebnisse_max_players)
