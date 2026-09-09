@@ -70,19 +70,17 @@ async fn db_read(pool: &Pool<Postgres>)  -> Vec<IpNetwork> {
         .unwrap();
     ips
 }
-async fn pinger(ip: IpNetwork) -> (Result<Response, craftping::Error>, String) {
+async fn pinger(ip: IpNetwork) -> (Option<Result<Response, std::io::Error>>, String) {
     let hostnamee: &str = &ip.to_string();
     let hostname: &str = "5.175.249.209";
     let port = 25565;
     let stream_nt_unwraped = TcpStream::connect((hostname, port)).await;
     let mut stream = match stream_nt_unwraped {
-        Ok(k) => {Some(k)},
-        Err(e) => {None},
+        Ok(k) => {k},
+        Err(e) => {return (Some(Err(e)), ip.to_string());},
     };
-    if let Some(stream) = stream {
-        let ping = ping(&mut stream, hostname, port).await;
-        return (ping, hostname.to_string())
-    };
+    let ping = ping(&mut stream, hostname, port).await.ok();
+    return (Some(ping), hostname);
 }
 async fn db_write(pool: &Pool<Postgres>, ergebnisse_ip: Vec<String>, ergebnisse_version: Vec<String>, ergebnisse_protocol: Vec<i32>, ergebnisse_max_players: Vec<i32>, ergebnisse_online_players: Vec<i32>, ergebnisse_description: Vec<String>, ergebnisse_sample: Vec<String>) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error>{
     let Result = sqlx::query(
