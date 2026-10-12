@@ -6,9 +6,12 @@ use ipnetwork::IpNetwork;
 use serde_json::Value;
 use serde::Serialize;
 use craftping::Player;
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, Semaphore, RwLockWriteGuard};
-use std::io;
+use std::{collections::HashMap, sync::Arc, io};
+use tokio::sync::{RwLock, Semaphore};
+use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use colored::Colorize;
+use chrono::prelude::*;
 #[derive(PartialEq, Debug, Clone, sqlx::FromRow)]
 struct IpInfo {
     ip: IpNetwork,
@@ -21,6 +24,10 @@ struct IpInfo {
     description: Option<String>,
     #[sqlx(default)]
     sample: Option<Vec<String>>,
+    #[sqlx(default)]
+    no_answer_count: Option<i32>,
+    #[sqlx(default)]
+    last_answer: Option<DateTime<Utc>>,
 }
 struct Update {
     ip: IpNetwork,
@@ -35,60 +42,169 @@ impl Json for Value {}
 async fn main() {
     let pool = PgPoolOptions::new()
         .max_connections(50)
-        .connect("postgres://postgres:Erik0601!@5.175.249.209/postgres").await.unwrap();
-    println!("DB verbunden");
-    let mut ergebnisse: Vec<IpInfo> = Vec::new();
+        .connect("postgres://postgres:47tc34tcbterkfb349crewd@unesty.mcinfos.de/postgres").await.unwrap();
+    println!("{}", "DB verbunden".green());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<IpInfo>(10000);
-    let len: Arc<RwLock<i32>> = Arc::new(RwLock::new(10000));
+
     let scans: Arc<RwLock<HashMap<IpNetwork, Option<IpInfo>>>> = db_read_ips(&pool).await;
     let pool_cloned = pool.clone();
-    let len_clone = Arc::clone(&len);
     let scans_anders = Arc::clone(&scans);
     task::spawn(async move {
-        loop {
-        let guard = len_clone.read().await;
-        let len = *guard;
+        let mut bereits_gescanned: Vec<Update> = Vec::with_capacity(10000);
+        let mut neue: Vec<IpInfo> = Vec::new();
+        while let Some(e) = rx.recv().await {
+                let mut guard = scans_anders.write().await;
+                if let Some(Some(i)) = guard.get(&e.ip).clone() {
+                    if i.version == e.version
+                        &&i.protocol == e.protocol
+                        &&i.max_players == e.max_players
+                        &&i.description == e.description {
+                            if i.online_players != e.online_players
+                                || i.sample != e.sample {
+                                    let update = Update {
+                                        ip: e.ip,
+                                        port: e.port,
+                                        online_players: e.online_players.clone(),
+                                        sample: e.sample.clone(),
+                                    };
+                                guard.insert(e.ip, Some(e.clone()));
+                                bereits_gescanned.push(update);
+                            }
+                }
+            continue;
+        }
+        let insert = IpInfo {
+            ip: e.ip,
+            port: e.port,
+            version: e.version,
+            protocol: e.protocol,
+            max_players: e.max_players,
+            online_players: e.online_players,
+            description: e.description,
+            sample: e.sample,
+            last_answer: Some(Utc::now()),
+            no_answer_count: Some(0),
+        };
+        guard.insert(insert.ip, Some(insert.clone()));
+        neue.push(insert);
         drop(guard);
-        while let Some(infos) = rx.recv().await {
-            ergebnisse.push(infos);
-            if len != 10000 {
-                let guard = scans_anders.write().await;
-                let _ = db_write(&pool_cloned, &ergebnisse, guard).await;
+            if neue.len() >= 100 || bereits_gescanned.len() >= 100 {
+                let ergebnis = std::mem::take(&mut neue);
+                let update = std::mem::take(&mut bereits_gescanned);
+                let result = db_write(&pool_cloned, &ergebnis, update).await;
+                match result {
+                    true => (),
+                    false => {println!("{}", "Fehler db_write".red());
+                std::process::abort();},
+                };
                 continue;
             }
-            if ergebnisse.len() >= 100 {
-                let guard = scans_anders.write().await;
-                let ergebnis = std::mem::take(&mut ergebnisse);
-                let _ = db_write(&pool_cloned, &ergebnis, guard).await;
-                continue;
-            }
-        }}
+        }
     });
-    let mut index: i64 = 0;
     let mut scans_pro_sek = String::new();
+    let (keine_antwort_tx, mut keine_antwort_rx) = tokio::sync::mpsc::channel::<IpNetwork>(10000);
+    println!("Wie viel gleichzeitige Tcp Verbindungen?");
     io::stdin()
         .read_line(&mut scans_pro_sek)
         .expect("Machs richtig");
+    let mut typ = String::new();
+    println!("Rescan, Ipv4 Scan, beides oder Ununsed Server cleanup 1/2/3/4");
+    io::stdin()
+        .read_line(&mut typ)
+        .expect("Machs richtig");
+    if typ.trim() == "1" {
+        println!("{}", "Rescan gestartet".green());
+        let scans_andere = Arc::clone(&scans);
+        task::spawn(async move {
+            while let Some(e) = keine_antwort_rx.recv().await {
+            let mut guard = scans_andere.write().await;
+            let ipinfo = guard.get(&e).unwrap();
+            if let Some(ipinfos) = ipinfo {
+            let no_answer_count = match ipinfos.no_answer_count {
+                Some(e) => e + 1,
+                None => 1,
+            };
+            let update = IpInfo {
+                ip: ipinfos.ip,
+                port: ipinfos.port,
+                version: ipinfos.version.clone(),
+                protocol: ipinfos.protocol,
+                max_players: ipinfos.max_players,
+                online_players: ipinfos.online_players,
+                description: ipinfos.description.clone(),
+                sample: ipinfos.sample.clone(),
+                no_answer_count: Some(no_answer_count) ,
+                last_answer: ipinfos.last_answer,
+            };
+            guard.insert(update.ip, Some(update));
+            }}
+        });
+        loop {
+            let scan = Arc::clone(&scans);
+            let scans = scan.read().await;
+            let tx = tx.clone();
+            println!("Rescan start");
+            rescan(tx, scans_pro_sek.clone().trim().parse::<i32>().unwrap(), scans.clone(), keine_antwort_tx.clone()).await;
+            println!("{}", "Rescan fertig, weiterer Scan".green());
+        }
+    };
+        if typ.trim() == "3" {
+        let tx = tx.clone();
+        let scans_pro_sek = scans_pro_sek.clone();
+        let scans = scans.clone();
+        task::spawn(async move{
+            loop {
+                let scan = Arc::clone(&scans);
+                let scans = scan.read().await;
+                let tx = tx.clone();
+                println!("Rescan start");
+                rescan(tx, scans_pro_sek.clone().trim().parse::<i32>().unwrap(), scans.clone(), keine_antwort_tx.clone()).await;
+                println!("{}", "Rescan fertig, weiterer Scan".green());
+            }
+        });
+    };
+    let (ip_tx, mut ip_rx) = tokio::sync::mpsc::channel::<IpNetwork>(10000);
+    task::spawn(async move {
+        let mut zmap = Command::new("zmap").arg("-G").arg("82:01:a5:d2:71:56").arg("-p").arg("25565").arg("-b").arg("/etc/zmap/blacklist.conf").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().expect("Zmap");
+        println!("{}", "Zmap gestartet".green());
+        if let Some(stdout) = zmap.stdout.take() {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(werte)) = lines.next_line().await {
+                let getrimmed = werte.trim();
+                if getrimmed.is_empty() {
+                    continue;
+                }
+                match getrimmed.parse::<std::net::IpAddr>() {
+                    Ok(ip) => {
+                        let k = IpNetwork::from(ip);
+                        let e = ip_tx.send(k).await;
+                        match e {
+                            Ok(_) => (),
+                            Err(ee)=> println!("Fehler beim senden Zmap: {:?}", ee),
+
+                        };
+                    }
+                    Err(e) => {println!("Fehler beim trimmen bei Zmap: {:?}", e);}
+                }
+            }
+};
+println!("If let hat kein Bock");
+    });
     let sem = Arc::new(Semaphore::new(scans_pro_sek.trim().parse().unwrap()));
-    let mut anzahl = 0;
     loop {
-    let ips = db_read(&pool, &index).await;
-    let mut guard = len.write().await;
-    *guard = ips.len() as i32;
-    drop(guard);
     let mut set = JoinSet::new();
-    println!("Anzahl: {}, Ips gelesen anzahl sollten 10k sein: {}", anzahl, ips.len());
-    anzahl += 10000;
-    for ip in ips {
+    while let Some(ip) = ip_rx.recv().await {
     let sem = Arc::clone(&sem);
     let scan = Arc::clone(&scans);
     let tx = tx.clone();
-    let _permit = sem.clone().acquire_owned().await.unwrap();
+    while set.len() >= 1000 {
+        set.join_next().await;
+    }
     set.spawn(async move {
-        let _erlaubnis = sem.acquire().await.unwrap();
+        let _permit = sem.clone().acquire_owned().await.unwrap();
         let guard = scan.read().await;
         if let Some(None) = guard.get(&ip) {
-            println!("Opt-out");
+            println!("{}", "Opt-out".blue());
             return;
         }
         drop(guard);
@@ -106,24 +222,20 @@ async fn main() {
             return;
         }        
         }
-        let _ = tx.send(sendung).await;
+        let e = tx.send(sendung).await;
+        match e {
+            Ok(_) => (),
+            Err(ee) => println!("{} {:?}", "Fehler senden im Channel:".red(), ee),
+
+        }
     });
     }
     while let Some(s) = set.join_next().await {
         if let Err(e) = s {
-            eprintln!("{:?}", e)
+            println!("{} {:?}", "Fehler:".red(), e)
         }
     }
-    index += 10000;
 }
-}
-async fn db_read(pool: &Pool<Postgres>, index: &i64)  -> Vec<IpNetwork> {
-    let ips: Vec<IpNetwork> = sqlx::query_scalar("SELECT ip, id FROM ips WHERE id > $1 ORDER BY id LIMIT 10000;")
-        .bind(index)
-        .fetch_all(pool)
-        .await
-        .unwrap();
-    ips
 }
 async fn pinger(ip: IpNetwork) -> Option<IpInfo> {
     let hostname: &str = &ip.ip().to_string();
@@ -146,8 +258,9 @@ async fn pinger(ip: IpNetwork) -> Option<IpInfo> {
                         online_players: Some(ping.online_players as i32),
                         description: jsoniser(ping.description),
                         sample: ping.sample.map(|players| {players.iter().map(|player| player.name.clone()).collect()}),
+                        no_answer_count: Some(0),
+                        last_answer: Some(Utc::now()),
                 };
-                println!("Server gefunden Ip: {}", ergebnis.ip);
             return Some(ergebnis);
         },
         _ => {return None},
@@ -155,56 +268,26 @@ async fn pinger(ip: IpNetwork) -> Option<IpInfo> {
 }
 return None;
 }
-async fn db_write(pool: &Pool<Postgres>, ergebnisse1: &Vec<IpInfo>,mut guard: RwLockWriteGuard<'_, HashMap<IpNetwork, Option<IpInfo>>>) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
-    let ergebnisse = ergebnisse1.clone();
-    let mut ergebnisse_ip: Vec<IpNetwork> = Vec::with_capacity(10000);
-    let mut ergebnisse_version: Vec<String> = Vec::with_capacity(10000);
-    let mut ergebnisse_protocol: Vec<i16> = Vec::with_capacity(10000);
-    let mut ergebnisse_max_players: Vec<i32> = Vec::with_capacity(10000);
-    let mut ergebnisse_online_players: Vec<i32> = Vec::with_capacity(10000);
-    let mut ergebnisse_sample: Vec<Option<Vec<String>>> = Vec::with_capacity(10000);
-    let mut ergebnisse_description: Vec<Option<String>> = Vec::with_capacity(10000);
-    let mut bereits_gescanned: Vec<Update> = Vec::with_capacity(10000);
-    for e in ergebnisse {
-        if let Some(Some(i)) = guard.get(&e.ip).clone() {
-            if i.version == e.version
-                &&i.protocol == e.protocol
-                &&i.max_players == e.max_players
-                ||i.description == e.description {
-                    if i.sample != e.sample
-                    &&i.online_players != e.online_players {
-                    let update = Update {
-                        ip: e.ip,
-                        port: e.port,
-                        online_players: e.online_players.clone(),
-                        sample: e.sample.clone(),
-                    };
-                    guard.insert(e.ip, Some(e.clone()));
-                    bereits_gescanned.push(update);   
-                    }
-                }
-            continue;
-        }
-        ergebnisse_ip.push(e.ip);
-        ergebnisse_version.push(e.version);
-        ergebnisse_protocol.push(e.protocol);
-        ergebnisse_max_players.push(e.max_players);
-        ergebnisse_online_players.push(e.online_players.unwrap());
-        ergebnisse_sample.push(e.sample);
-        ergebnisse_description.push(e.description);
-    }
-    drop(guard);
-    let result = sqlx::query(
-        r#"INSERT INTO servers (ip, version, protocol, max_players, description) SELECT * FROM UNNEST($1, $2, $3, $4, $5)"#)
-        .bind(ergebnisse_ip)
-        .bind(ergebnisse_version)
-        .bind(ergebnisse_protocol)
-        .bind(ergebnisse_max_players)
-        .bind(ergebnisse_description)
-        .execute(pool)
-        .await;
+async fn db_write(pool: &Pool<Postgres>, ergebnisse1: &Vec<IpInfo>, bereits_gescanned: Vec<Update>) -> bool {
+    if !ergebnisse1.is_empty() {
+    let mut builder1 = QueryBuilder::<Postgres>::new("INSERT INTO servers (ip, port, version, protocol, max_players, description)");
+    builder1.push_values(ergebnisse1, |mut b, inserts| {
+        b.push_bind(inserts.ip)
+         .push_bind(inserts.port)
+         .push_bind(inserts.version.clone())
+         .push_bind(inserts.protocol)
+         .push_bind(inserts.max_players)
+         .push_bind(inserts.description.clone());
+    });
+    let query1 = builder1.build();
+    let result = query1.execute(pool).await;
+    match result {
+        Ok(_) => (),
+        Err(e) => {println!("Fehler dbwrite Result: {:?}", e);
+    return false},
+    };}
     if !bereits_gescanned.is_empty() {
-    let mut builder = QueryBuilder::<Postgres>::new("INSERT INTO status (ip, port, online_players, sample) ");
+    let mut builder = QueryBuilder::<Postgres>::new("INSERT INTO status (ip, port, online_players, sample)");
     builder.push_values(bereits_gescanned, |mut b, updates| {
         b.push_bind(updates.ip)
          .push_bind(updates.port)
@@ -212,9 +295,14 @@ async fn db_write(pool: &Pool<Postgres>, ergebnisse1: &Vec<IpInfo>,mut guard: Rw
          .push_bind(updates.sample);
     });
     let query = builder.build();
-    let _ = query.execute(pool).await;
-    }
-    result
+    let result2 = query.execute(pool).await;
+    match result2 {
+        Ok(_) => (),
+        Err(e) => {println!("Fehler dbwrite Result2: {:?}", e);
+    return false},
+    };}
+    println!("{}", "Ergebnisse erfolgreich geschrieben.".green());
+    true
 }
 fn jsoniser<T: Json>(players: Option<T>) -> Option<String> {
     if let Some(wert) = players {
@@ -228,6 +316,7 @@ async fn db_read_opt_out(pool: &Pool<Postgres>)  -> Arc<RwLock<HashMap<IpNetwork
         .fetch_all(pool)
         .await
         .unwrap();
+    println!("Länge Opt-Out: {}", ips.len());
     let scans: Arc<RwLock<HashMap<IpNetwork, Option<IpInfo>>>> = Arc::new(RwLock::new(HashMap::new()));
     for ip in ips {
         let mut guard = scans.write().await;
@@ -241,9 +330,10 @@ async fn db_read_ips(pool: &Pool<Postgres>)  -> Arc<RwLock<HashMap<IpNetwork, Op
         .fetch_all(pool)
         .await
         .unwrap();
+    println!("Anzahl der Ips ohne Opt-Out: {}", ips.len());
     for ip in ips {
         let mut guard = scans.write().await;
-        let ergebnis= IpInfo {
+        let ergebnis = IpInfo {
             ip: ip.ip,
             port: ip.port,
             version: ip.version,
@@ -252,9 +342,85 @@ async fn db_read_ips(pool: &Pool<Postgres>)  -> Arc<RwLock<HashMap<IpNetwork, Op
             online_players: None,
             sample: None,
             description: ip.description,
+            last_answer: None,
+            no_answer_count: Some(0),
         };
         guard.insert(ip.ip, Some(ergebnis));
     }
     scans
 }
+async fn rescan(tx: tokio::sync::mpsc::Sender<IpInfo>, scans_pro_sek: i32, guard: HashMap<IpNetwork, Option<IpInfo>>, tx_no_answer: tokio::sync::mpsc::Sender<IpNetwork>
+) {
+    let sem = Arc::new(Semaphore::new(scans_pro_sek as usize));
+    let mut set = JoinSet::new();
+    let mut ips: Vec<IpNetwork> = Vec::new();
+    for key in guard.keys() {
+        ips.push(key.clone());
+    };
+    let guard = Arc::new(guard);
+    for e in ips {
+        let tx2 = tx_no_answer.clone();
+        let guard = Arc::clone(&guard);
+        let tx_clone = tx.clone();
+        let sem = Arc::clone(&sem);
+        set.spawn(async move {
+            let ip: IpNetwork = e.clone();
+            let _permit = sem.clone().acquire_owned().await.unwrap();
+            let ergebnis = timeout(Duration::from_secs(4), pinger(ip)).await;
+            if let Ok(ergebnis) = ergebnis {
+            match ergebnis {
+                Some(ping) => {
+                    if guard.contains_key(&ip) {
+                        let alte_infos = guard.get(&ip);
+                        match alte_infos {
+                            Some(Some(alte_info)) => {
+                                if alte_info == &ping {
+                                return
+                                };
+                                if &alte_info.ip != &ip {
+                                println!("{}", "Hier ist etwas extrem schief gelaufen".red());
+                                std::process::abort()
+                                }
+                                let insert = IpInfo {
+                                    ip: ip,
+                                    port: 25565 as i16,
+                                    version: ping.version,
+                                    protocol: ping.protocol as i16,
+                                    max_players: ping.max_players as i32,
+                                    online_players: ping.online_players,
+                                    description: ping.description,
+                                    sample: ping.sample,
+                                    last_answer: Some(Utc::now()),
+                                    no_answer_count: Some(0),
+                                };
+                                drop(guard);
+                                let e = tx_clone.send(insert).await;
+                                match e {
+                                    Ok(_) => (),
+                                    Err(ee) => println!("{} {:?}", "Fehler senden im Channel:".red(), ee),
+                                }
+                                return
+                            }
+                            _ => {println!("{}", "Uiii hier ist was falsch gegangen. Grund: Rescanner hat Ips bekommen die nicht gescanned werden sollten".red());}
+                        }
+                    }
+                },
+                None => {let result = tx2.send(ip).await;
+                    match result {
+                        Ok(_) => (),
+                        Err(e) => {println!("{} {}", "Fehler nichtantwortende ip in den channel senden:".red(), e);
+                        std::process::abort();
+                    }
+                    }
+                    return;},
+            };}
+            return;
+        });
+        }
+        while let Some(s) = set.join_next().await {
+            if let Err(e) = s {
+                println!("{} {:?}", "Fehler:".red(), e)
+            }
+        }
+    }
 
